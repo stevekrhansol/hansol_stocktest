@@ -3,7 +3,8 @@ import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
-from datetime import datetime, timedelta
+from datetime import datetime
+from openai import OpenAI
 
 # ── 페이지 설정 ──────────────────────────────────────────────
 st.set_page_config(
@@ -14,16 +15,16 @@ st.set_page_config(
 
 # ── 종목 목록 ────────────────────────────────────────────────
 STOCKS = {
-    "삼성전자":    "005930.KS",
-    "SK하이닉스":  "000660.KS",
+    "삼성전자":       "005930.KS",
+    "SK하이닉스":     "000660.KS",
     "LG에너지솔루션": "373220.KS",
-    "현대차":      "005380.KS",
+    "현대차":         "005380.KS",
     "삼성바이오로직스": "207940.KS",
-    "셀트리온":    "068270.KS",
-    "NAVER":       "035420.KS",
-    "카카오":      "035720.KS",
-    "POSCO홀딩스": "005490.KS",
-    "KB금융":      "105560.KS",
+    "셀트리온":       "068270.KS",
+    "NAVER":          "035420.KS",
+    "카카오":         "035720.KS",
+    "POSCO홀딩스":    "005490.KS",
+    "KB금융":         "105560.KS",
 }
 
 PERIOD_MAP = {
@@ -52,6 +53,15 @@ with st.sidebar:
     )
     st.caption("종목 요약 카드는 전체 10개를 표시합니다.")
 
+    st.divider()
+    st.header("🤖 AI 챗봇 설정")
+    api_key_input = st.text_input(
+        "OpenAI API Key",
+        type="password",
+        placeholder="sk-...",
+        help="GPT-4o-mini 사용을 위해 OpenAI API Key를 입력하세요.",
+    )
+
 # ── 데이터 수집 ──────────────────────────────────────────────
 @st.cache_data(ttl=300)
 def fetch_summary(tickers: dict) -> pd.DataFrame:
@@ -60,12 +70,12 @@ def fetch_summary(tickers: dict) -> pd.DataFrame:
         try:
             info = yf.Ticker(ticker).fast_info
             rows.append({
-                "종목명":   name,
-                "티커":     ticker,
-                "현재가":   info.last_price,
-                "전일종가": info.previous_close,
-                "52주 최고": info.year_high,
-                "52주 최저": info.year_low,
+                "종목명":      name,
+                "티커":        ticker,
+                "현재가":      info.last_price,
+                "전일종가":    info.previous_close,
+                "52주 최고":   info.year_high,
+                "52주 최저":   info.year_low,
                 "시가총액(조)": round(info.market_cap / 1e12, 2) if info.market_cap else None,
             })
         except Exception:
@@ -76,7 +86,7 @@ def fetch_summary(tickers: dict) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
-def fetch_history(tickers: dict, period: str) -> dict[str, pd.DataFrame]:
+def fetch_history(tickers: dict, period: str) -> dict:
     result = {}
     for name, ticker in tickers.items():
         try:
@@ -138,7 +148,6 @@ if history_data:
         close = df["Close"]
         if hasattr(close, "squeeze"):
             close = close.squeeze()
-        # 기준 정규화 (첫 날 = 100)
         normalized = close / close.iloc[0] * 100
         fig_line.add_trace(go.Scatter(
             x=normalized.index,
@@ -216,3 +225,83 @@ with st.expander("📄 원본 데이터 보기"):
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 st.caption(f"데이터 출처: Yahoo Finance  |  마지막 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+st.divider()
+
+# ── AI 챗봇 ──────────────────────────────────────────────────
+st.subheader("🤖 AI 주식 분석 챗봇")
+st.markdown("수집된 주식 데이터를 바탕으로 GPT-4o-mini가 질문에 답변합니다.")
+
+def build_system_prompt(df: pd.DataFrame) -> str:
+    lines = ["당신은 한국 주식 전문 AI 애널리스트입니다. 아래는 현재 수집된 국내 주식 10개의 실시간 데이터입니다.\n"]
+    for _, row in df.iterrows():
+        price  = f"{int(row['현재가']):,}원" if pd.notna(row.get("현재가")) else "N/A"
+        prev   = f"{int(row['전일종가']):,}원" if pd.notna(row.get("전일종가")) else "N/A"
+        change = f"{row['등락(%)']:+.2f}%" if pd.notna(row.get("등락(%)")) else "N/A"
+        hi52   = f"{int(row['52주 최고']):,}원" if pd.notna(row.get("52주 최고")) else "N/A"
+        lo52   = f"{int(row['52주 최저']):,}원" if pd.notna(row.get("52주 최저")) else "N/A"
+        mcap   = f"{row['시가총액(조)']}조 원" if pd.notna(row.get("시가총액(조)")) else "N/A"
+        lines.append(
+            f"- {row['종목명']} ({row['티커']}): 현재가 {price}, 전일종가 {prev}, "
+            f"등락 {change}, 52주 최고 {hi52}, 52주 최저 {lo52}, 시가총액 {mcap}"
+        )
+    lines.append(
+        "\n위 데이터를 기반으로 사용자 질문에 친절하고 전문적으로 한국어로 답변하세요. "
+        "투자 권유는 하지 말고, 데이터 분석과 정보 제공에 집중하세요."
+    )
+    return "\n".join(lines)
+
+
+# 세션 상태 초기화
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = []
+
+# 대화 기록 출력
+for msg in st.session_state.chat_messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# 입력창
+user_input = st.chat_input("주식에 대해 궁금한 점을 질문하세요. 예) 삼성전자 현재 상태는?")
+
+if user_input:
+    if not api_key_input:
+        st.warning("사이드바에서 OpenAI API Key를 입력해주세요.")
+    else:
+        # 사용자 메시지 추가
+        st.session_state.chat_messages.append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        # GPT 응답
+        with st.chat_message("assistant"):
+            with st.spinner("분석 중..."):
+                try:
+                    client = OpenAI(api_key=api_key_input)
+                    system_prompt = build_system_prompt(summary_df)
+
+                    response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            *st.session_state.chat_messages,
+                        ],
+                        temperature=0.7,
+                        max_tokens=1000,
+                    )
+                    answer = response.choices[0].message.content
+                    st.markdown(answer)
+                    st.session_state.chat_messages.append({"role": "assistant", "content": answer})
+
+                except Exception as e:
+                    err = str(e)
+                    if "auth" in err.lower() or "api_key" in err.lower() or "401" in err:
+                        st.error("API Key가 올바르지 않습니다. 사이드바에서 다시 확인해주세요.")
+                    else:
+                        st.error(f"오류가 발생했습니다: {err}")
+
+# 대화 초기화 버튼
+if st.session_state.chat_messages:
+    if st.button("대화 초기화"):
+        st.session_state.chat_messages = []
+        st.rerun()
